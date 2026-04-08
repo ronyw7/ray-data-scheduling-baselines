@@ -1,3 +1,7 @@
+# Ignore working files
+_experiments/
+_paper/
+
 # The build output should clearly not be checked in
 *test-output.xml
 /bazel-*
