@@ -86,9 +86,8 @@ class StreamingExecutor(Executor, threading.Thread):
         # Least-Laxity-First (LLF) scheduling policy parameters.
         # Implements Cameo (NSDI'21) Equation 2 for operator selection:
         #
-        #   ddl_M = t_M + L - C_oM - C_path
-        #   laxity = ddl_M - now
-        #   selected_op = argmin(laxity)
+        #   ddl_M = ddl_M = t_M + L - C_oM - C_path 
+        #   selected_op = argmin(ddl_M)
         #
         # where:
         #   t_M    = message creation time. In v1: t_M=0. In v2: t_M = i * T
