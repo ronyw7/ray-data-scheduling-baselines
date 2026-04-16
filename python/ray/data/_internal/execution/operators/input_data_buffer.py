@@ -1,3 +1,4 @@
+import time
 from typing import Callable, List, Optional
 
 from ray.data._internal.execution.interfaces import (
@@ -63,6 +64,11 @@ class InputDataBuffer(PhysicalOperator):
         # We can't pop the input data. If we do, Ray might garbage collect the block
         # references, and Ray won't be able to reconstruct downstream objects.
         bundle = self._input_data[self._input_data_index]
+        # Stamp metadata for LLF scheduling policy.
+        if bundle.creation_time is None:
+            bundle.creation_time = time.time()
+        if bundle.partition_index is None:
+            bundle.partition_index = self._input_data_index
         self._input_data_index += 1
         return bundle
 

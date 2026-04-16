@@ -310,6 +310,17 @@ class DataContext:
     execution_options: "ExecutionOptions" = field(
         default_factory=_execution_options_factory
     )
+    # Operator scheduling policy for baseline experiments:
+    #   None    = default Ray Data (least memory usage)
+    #   "llf_v1" = Cameo LLF with t_M=0, L=0 (collapses to stage-by-stage)
+    #   "llf_v2" = Cameo LLF with t_M=i*T, L=configurable
+    #   "edf"    = Cameo EDF (deadline without self-cost C_oM)
+    scheduling_policy: Optional[str] = None
+    # Inter-arrival time T for LLF v2: t_M = partition_index * T (seconds).
+    llf_inter_arrival_time: float = 0.1
+    # Latency target L for LLF v2/EDF (seconds). If None, auto-computed as
+    # sum(avg_task_duration for all ops) (floored at 1.0 during cold start).
+    llf_latency_target: Optional[float] = None
     use_ray_tqdm: bool = DEFAULT_USE_RAY_TQDM
     enable_progress_bars: bool = DEFAULT_ENABLE_PROGRESS_BARS
     # By default, enable the progress bar for operator-level progress.

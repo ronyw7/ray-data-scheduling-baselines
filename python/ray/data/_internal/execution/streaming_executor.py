@@ -79,6 +79,30 @@ class StreamingExecutor(Executor, threading.Thread):
         self._has_op_completed: Optional[Dict[PhysicalOperator, bool]] = None
         self._max_errored_blocks = DataContext.get_current().max_errored_blocks
         self._num_errored_blocks = 0
+        
+        ctx = DataContext.get_current()
+        self._scheduling_policy = ctx.scheduling_policy
+
+        # Least-Laxity-First (LLF) scheduling policy parameters.
+        # Implements Cameo (NSDI'21) Equation 2 for operator selection:
+        #
+        #   ddl_M = t_M + L - C_oM - C_path
+        #   laxity = ddl_M - now
+        #   selected_op = argmin(laxity)
+        #
+        # where:
+        #   t_M    = message creation time. In v1: t_M=0. In v2: t_M = i * T
+        #            where i is the partition index.
+        #   L      = latency constraint (user-specified SLA). In v1: L=0.
+        #   C_oM   = estimated execution cost at operator o (profiled avg task
+        #            duration). Omitted in EDF variant.
+        #   C_path = max critical path cost from o to any sink operator,
+        #            computed as sum of C_oM along the longest downstream path.
+        #
+        # T: inter-arrival time for simulated streaming arrivals (v2 only).
+        self._llf_inter_arrival_time = ctx.llf_inter_arrival_time
+        # L: latency target. If None, auto-computed as sum(C_oM) (floored at 1.0).
+        self._llf_latency_target = ctx.llf_latency_target
 
         self._last_debug_log_time = 0
 
@@ -300,6 +324,9 @@ class StreamingExecutor(Executor, threading.Thread):
             self._backpressure_policies,
             self._autoscaler,
             ensure_at_least_one_running=self._consumer_idling(),
+            scheduling_policy=self._scheduling_policy,
+            llf_inter_arrival_time=self._llf_inter_arrival_time,
+            llf_latency_target=self._llf_latency_target,
         )
 
         i = 0
@@ -315,6 +342,9 @@ class StreamingExecutor(Executor, threading.Thread):
                 self._backpressure_policies,
                 self._autoscaler,
                 ensure_at_least_one_running=self._consumer_idling(),
+                scheduling_policy=self._scheduling_policy,
+                llf_inter_arrival_time=self._llf_inter_arrival_time,
+                llf_latency_target=self._llf_latency_target,
             )
 
         update_operator_states(topology)

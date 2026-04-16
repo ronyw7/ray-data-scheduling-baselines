@@ -78,6 +78,11 @@ class OpBufferQueue:
         with self._lock:
             return len(self._queue)
 
+    def peek(self) -> Optional[RefBundle]:
+        """Return the first RefBundle without removing it, or None if empty."""
+        with self._lock:
+            return self._queue.peek() if len(self._queue) > 0 else None
+
     def has_next(self, output_split_idx: Optional[int] = None) -> bool:
         """Whether next RefBundle is available.
 
@@ -199,6 +204,12 @@ class OpState:
         self._finished: bool = False
         self._exception: Optional[Exception] = None
         self._scheduling_status = OpSchedulingStatus()
+        # Track LLF metadata from dispatched input bundles so we can stamp
+        # output bundles with creation_time/partition_index. This is a FIFO
+        # queue of (creation_time, partition_index) tuples.
+        from collections import deque
+
+        self._llf_input_metadata: deque = deque()
 
     def __repr__(self):
         return f"OpState({self.op.name})"
@@ -248,12 +259,20 @@ class OpState:
 
     def add_output(self, ref: RefBundle) -> None:
         """Move a bundle produced by the operator to its outqueue."""
+        # Propagate LLF metadata from input to output bundles.
+        if self._llf_input_metadata and ref.creation_time is None:
+            creation_time, partition_index = self._llf_input_metadata[0]
+            ref.creation_time = creation_time
+            ref.partition_index = partition_index
+            # Pop only when we've seen enough outputs for this input.
+            # For simplicity, pop one metadata per output bundle.
+            self._llf_input_metadata.popleft()
         self.outqueue.append(ref)
         self.num_completed_tasks += 1
         if self.progress_bar:
-            assert (
-                ref.num_rows() is not None
-            ), "RefBundle must have a valid number of rows"
+            assert ref.num_rows() is not None, (
+                "RefBundle must have a valid number of rows"
+            )
             self.progress_bar.update(ref.num_rows(), self.op.num_output_rows_total())
 
     def refresh_progress_bar(self, resource_manager: ResourceManager) -> None:
@@ -292,6 +311,10 @@ class OpState:
         for i, inqueue in enumerate(self.inqueues):
             ref = inqueue.pop()
             if ref is not None:
+                # Track LLF metadata from input so we can stamp outputs.
+                self._llf_input_metadata.append(
+                    (ref.creation_time, ref.partition_index)
+                )
                 self.op.add_input(ref, input_index=i)
                 return
         assert False, "Nothing to dispatch"
@@ -530,12 +553,116 @@ def update_operator_states(topology: Topology) -> None:
             op.mark_execution_completed()
 
 
+def _avg_task_duration(op: PhysicalOperator) -> float:
+    """Average task duration for an operator, from profiling data."""
+    metrics = op.metrics
+    if metrics.num_tasks_finished > 0:
+        return metrics.block_generation_time / metrics.num_tasks_finished
+    return 0.0
+
+
+def _compute_c_path(
+    topology: Topology,
+) -> Dict[PhysicalOperator, float]:
+    """Compute the critical path cost from each operator to the sink.
+
+    C_path[sink] = 0
+    C_path[op] = max over successors of (C_oM[succ] + C_path[succ])
+
+    Uses profiled average task duration as C_oM. Falls back to 0 if
+    no tasks have finished yet.
+    """
+    c_path: Dict[PhysicalOperator, float] = {}
+
+    # Process in reverse topological order (topology dict is topo-sorted).
+    for op in reversed(list(topology.keys())):
+        successors = op.output_dependencies
+        if not successors:
+            c_path[op] = 0.0
+        else:
+            c_path[op] = max(
+                _avg_task_duration(succ) + c_path.get(succ, 0.0) for succ in successors
+            )
+    return c_path
+
+
+def _get_t_m(
+    bundle: "RefBundle",
+    policy: str,
+    inter_arrival_time: float,
+) -> float:
+    """Compute t_M (message creation time) for a bundle based on policy.
+
+    - llf_v1: t_M = 0 (all partitions have the same "arrival time")
+    - llf_v2: t_M = partition_index * T (simulated streaming arrivals)
+    - edf:    t_M = partition_index * T (same as v2)
+    """
+    if policy == "llf_v1":
+        return 0.0
+    else:
+        # v2 and edf use simulated arrival times.
+        idx = bundle.partition_index if bundle.partition_index is not None else 0
+        return idx * inter_arrival_time
+
+
+def _get_latency_target(
+    policy: str,
+    topology: Topology,
+    llf_latency_target: Optional[float],
+) -> float:
+    """Compute L (latency target) based on policy.
+
+    - llf_v1: L = 0
+    - llf_v2/edf: L = user-specified or auto-computed from profiled durations
+    """
+    if policy == "llf_v1":
+        return 0.0
+
+    if llf_latency_target is not None:
+        return llf_latency_target
+
+    # Auto-compute: L = sum(avg_task_duration across all ops).
+    L = sum(_avg_task_duration(op) for op in topology)
+    # Floor to avoid degenerate behavior before profiling data is available.
+    return max(L, 1.0)
+
+
+def _compute_min_deadline(
+    op: PhysicalOperator,
+    state: "OpState",
+    c_om: float,
+    c_path_val: float,
+    latency_target: float,
+    policy: str,
+    inter_arrival_time: float,
+) -> float:
+    """Compute the minimum start-deadline across pending bundles in op's inqueues.
+
+    ddl_M = t_M + L - C_oM - C_path    (Cameo Eq. 2)
+
+    Per Cameo §4.2.1, "ddl_M is the message priority (lower value implies higher
+    priority)." Within a single scheduling tick, argmin(ddl - now) == argmin(ddl),
+    so we return ddl directly rather than subtracting a constant `now`.
+    """
+    min_deadline = float("inf")
+    for inqueue in state.inqueues:
+        bundle = inqueue.peek()
+        if bundle is not None:
+            t_m = _get_t_m(bundle, policy, inter_arrival_time)
+            deadline = t_m + latency_target - c_om - c_path_val
+            min_deadline = min(min_deadline, deadline)
+    return min_deadline
+
+
 def select_operator_to_run(
     topology: Topology,
     resource_manager: ResourceManager,
     backpressure_policies: List[BackpressurePolicy],
     autoscaler: Autoscaler,
     ensure_at_least_one_running: bool,
+    scheduling_policy: Optional[str] = None,
+    llf_inter_arrival_time: float = 0.1,
+    llf_latency_target: Optional[float] = None,
 ) -> Optional[PhysicalOperator]:
     """Select an operator to run, if possible.
 
@@ -597,15 +724,78 @@ def select_operator_to_run(
 
     selected_op = None
     if ops:
-        # Run metadata-only operators first. After that, choose the operator with the
-        # least memory usage.
-        selected_op = min(
-            ops,
-            key=lambda op: (
-                not op.throttling_disabled(),
-                resource_manager.get_op_usage(op).object_store_memory,
-            ),
-        )
+        if scheduling_policy in ("llf_v1", "llf_v2", "edf"):
+            # Cameo-style scheduling (Equation 2):
+            #   ddl_M = t_M + L - C_oM - C_path    (priority; lower = higher pri.)
+            # Pick operator with minimum start-deadline (most urgent).
+            c_path = _compute_c_path(topology)
+            latency_target = _get_latency_target(
+                scheduling_policy,
+                topology,
+                llf_latency_target,
+            )
+
+            def _llf_key(op):
+                # EDF omits C_oM from the deadline (per Cameo paper).
+                c_om = _avg_task_duration(op) if scheduling_policy != "edf" else 0.0
+                deadline = _compute_min_deadline(
+                    op,
+                    topology[op],
+                    c_om,
+                    c_path.get(op, 0.0),
+                    latency_target,
+                    scheduling_policy,
+                    llf_inter_arrival_time,
+                )
+                # Metadata-only operators still get priority.
+                return (not op.throttling_disabled(), deadline)
+
+            # Log detailed breakdown for each eligible operator.
+            # Uses print() because the executor runs on a background thread
+            # where the logging configuration may not propagate.
+            import os
+
+            if os.environ.get("RAY_DATA_LLF_DEBUG"):
+                details = []
+                for op in ops:
+                    c_om = _avg_task_duration(op) if scheduling_policy != "edf" else 0.0
+                    cp = c_path.get(op, 0.0)
+                    # Peek at the head bundle's t_M.
+                    t_m_str = "n/a"
+                    for inq in topology[op].inqueues:
+                        b = inq.peek()
+                        if b is not None:
+                            t_m = _get_t_m(b, scheduling_policy, llf_inter_arrival_time)
+                            idx = b.partition_index
+                            ddl = t_m + latency_target - c_om - cp
+                            t_m_str = f"t_M={t_m:.3f} idx={idx} ddl={ddl:.3f}"
+                            break
+                    details.append(
+                        f"    {op.name}: C_oM={c_om:.3f} C_path={cp:.3f} {t_m_str}"
+                    )
+                print(
+                    f"LLF [{scheduling_policy}] L={latency_target:.3f} | "
+                    f"{len(ops)} eligible ops:"
+                )
+                for d in details:
+                    print(d)
+
+            selected_op = min(ops, key=_llf_key)
+
+            if os.environ.get("RAY_DATA_LLF_DEBUG"):
+                print(
+                    f"  -> selected: {selected_op.name} "
+                    f"(ddl={_llf_key(selected_op)[1]:.3f})"
+                )
+        else:
+            # Default Ray Data policy: least memory usage.
+            selected_op = min(
+                ops,
+                key=lambda op: (
+                    not op.throttling_disabled(),
+                    resource_manager.get_op_usage(op).object_store_memory,
+                ),
+            )
         topology[selected_op]._scheduling_status.selected = True
     autoscaler.try_trigger_scaling()
     return selected_op
