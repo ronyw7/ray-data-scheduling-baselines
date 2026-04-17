@@ -7,7 +7,7 @@ import logging
 import math
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -147,6 +147,11 @@ class OpBufferQueue:
             self._num_blocks = 0
             self._num_per_split.clear()
 
+    def peek(self) -> Optional[RefBundle]:
+        """Return the next RefBundle at the head of the queue without popping."""
+        with self._lock:
+            return self._queue.peek()
+
 
 @dataclass
 class OpSchedulingStatus:
@@ -199,6 +204,11 @@ class OpState:
         self._finished: bool = False
         self._exception: Optional[Exception] = None
         self._scheduling_status = OpSchedulingStatus()
+        # Queue of partition_index values for inputs currently dispatched to
+        # this operator (in-flight tasks). FIFO: each dispatch appends, each
+        # add_output pops and stamps the output bundle. Used by scheduling
+        # policies that need to group bundles into epochs (e.g., microbatch).
+        self._inflight_partition_indices: deque = deque()
 
     def __repr__(self):
         return f"OpState({self.op.name})"
@@ -248,6 +258,11 @@ class OpState:
 
     def add_output(self, ref: RefBundle) -> None:
         """Move a bundle produced by the operator to its outqueue."""
+        # Propagate the input partition_index to the output bundle so that
+        # scheduling policies can track a bundle across the DAG. Pops the
+        # earliest in-flight index FIFO-style.
+        if self._inflight_partition_indices and ref.partition_index is None:
+            ref.partition_index = self._inflight_partition_indices.popleft()
         self.outqueue.append(ref)
         self.num_completed_tasks += 1
         if self.progress_bar:
@@ -292,6 +307,8 @@ class OpState:
         for i, inqueue in enumerate(self.inqueues):
             ref = inqueue.pop()
             if ref is not None:
+                if ref.partition_index is not None:
+                    self._inflight_partition_indices.append(ref.partition_index)
                 self.op.add_input(ref, input_index=i)
                 return
         assert False, "Nothing to dispatch"
@@ -597,18 +614,98 @@ def select_operator_to_run(
 
     selected_op = None
     if ops:
-        # Run metadata-only operators first. After that, choose the operator with the
-        # least memory usage.
-        selected_op = min(
-            ops,
-            key=lambda op: (
-                not op.throttling_disabled(),
-                resource_manager.get_op_usage(op).object_store_memory,
-            ),
-        )
-        topology[selected_op]._scheduling_status.selected = True
+        ctx = DataContext.get_current()
+        if ctx.scheduling_policy == "microbatch":
+            selected_op = _microbatch_select(ops, topology, ctx.microbatch_size)
+        else:
+            # Run metadata-only operators first. After that, choose the operator with
+            # the least memory usage.
+            selected_op = min(
+                ops,
+                key=lambda op: (
+                    not op.throttling_disabled(),
+                    resource_manager.get_op_usage(op).object_store_memory,
+                ),
+            )
+        if selected_op is not None:
+            topology[selected_op]._scheduling_status.selected = True
     autoscaler.try_trigger_scaling()
     return selected_op
+
+
+def _compute_depth_map(topology: Topology) -> Dict[PhysicalOperator, int]:
+    """Return each op's depth (longest path from a source). `topology` is in
+    topological order, so a single pass suffices."""
+    depth: Dict[PhysicalOperator, int] = {}
+    for op in topology:
+        parents = op.input_dependencies
+        if not parents:
+            depth[op] = 0
+        else:
+            depth[op] = max(depth[p] for p in parents if p in depth) + 1
+    return depth
+
+
+def _global_min_epoch(topology: Topology, microbatch_size: int) -> Optional[int]:
+    """Minimum epoch across all in-flight work and inqueue heads in the DAG.
+
+    Returns None if no stamped bundle is found.
+    """
+    min_e: Optional[int] = None
+    for state in topology.values():
+        for pi in state._inflight_partition_indices:
+            e = pi // microbatch_size
+            if min_e is None or e < min_e:
+                min_e = e
+        for q in state.inqueues:
+            head = q.peek()
+            if head is not None and head.partition_index is not None:
+                e = head.partition_index // microbatch_size
+                if min_e is None or e < min_e:
+                    min_e = e
+    return min_e
+
+
+def _microbatch_select(
+    ops: List[PhysicalOperator],
+    topology: Topology,
+    microbatch_size: int,
+) -> Optional[PhysicalOperator]:
+    """BSP microbatch policy.
+
+    Enforces two barriers:
+      - Intra-batch stage barrier: within the active epoch, pick the shallowest
+        op (topologically earliest) with pending work.
+      - Inter-batch barrier: no op at epoch E+1 may run while any op in the DAG
+        still has work pending for epoch E (either in-flight or in its inqueue).
+
+    Both barriers collapse to one rule: find the global minimum epoch across all
+    pending work, then select the shallowest runnable op whose inqueue head is
+    at that epoch. If the minimum epoch is only present as in-flight work (no
+    op's inqueue head matches), return None and wait for the in-flight tasks to
+    drain.
+    """
+    B = max(1, microbatch_size)
+    min_e = _global_min_epoch(topology, B)
+    if min_e is None:
+        # No stamped bundles anywhere (e.g., tests with unstamped input). Fall
+        # back to running the first runnable op to avoid deadlock.
+        return ops[0]
+    eligible: List[PhysicalOperator] = []
+    for op in ops:
+        state = topology[op]
+        for q in state.inqueues:
+            head = q.peek()
+            if head is not None and head.partition_index is not None:
+                if head.partition_index // B == min_e:
+                    eligible.append(op)
+                    break
+    if not eligible:
+        # The min-epoch work is in-flight upstream; wait for it to drain before
+        # dispatching anything further.
+        return None
+    depth_map = _compute_depth_map(topology)
+    return min(eligible, key=lambda op: depth_map[op])
 
 
 def _execution_allowed(op: PhysicalOperator, resource_manager: ResourceManager) -> bool:

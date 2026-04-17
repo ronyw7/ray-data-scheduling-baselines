@@ -341,6 +341,18 @@ class DataContext:
         default_factory=lambda: list(DEFAULT_RETRIED_IO_ERRORS)
     )
 
+    # Scheduling policy selector. None means the default (resource-aware) policy.
+    # Set to "microbatch" to emulate Spark-Streaming / Drizzle-style BSP execution:
+    # bundles are grouped into epochs of `microbatch_size` consecutive input
+    # partitions, with an intra-batch stage barrier (topological, shallowest first)
+    # and an inter-batch barrier (epoch E+1 cannot begin until epoch E fully drains).
+    scheduling_policy: Optional[str] = None
+
+    # Number of input partitions (bundles) per microbatch when
+    # `scheduling_policy == "microbatch"`. Epoch of a bundle =
+    # partition_index // microbatch_size.
+    microbatch_size: int = 1
+
     def __post_init__(self):
         # The additonal ray remote args that should be added to
         # the task-pool-based data tasks.
