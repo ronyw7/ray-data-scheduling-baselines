@@ -663,6 +663,7 @@ def select_operator_to_run(
     scheduling_policy: Optional[str] = None,
     llf_inter_arrival_time: float = 0.1,
     llf_latency_target: Optional[float] = None,
+    llf_disable_admission_control: bool = False,
 ) -> Optional[PhysicalOperator]:
     """Select an operator to run, if possible.
 
@@ -677,10 +678,22 @@ def select_operator_to_run(
     provides backpressure if the consumer is slow. However, once a bundle is returned
     to the user, it is no longer tracked.
     """
+    # Faithful Cameo baseline: skip Ray Data's memory-budget admission control
+    # (Algorithm 2) for LLF scheduling. Cameo only has per-op flow control via
+    # hasOutputBufferSpace (preserved below by `should_add_input`) and the
+    # backpressure policies (concurrency caps).
+    bypass_admission = llf_disable_admission_control and scheduling_policy in (
+        "llf_v1",
+        "llf_v2",
+        "edf",
+    )
+
     # Filter to ops that are eligible for execution.
     ops = []
     for op, state in topology.items():
-        if resource_manager.op_resource_allocator_enabled():
+        if bypass_admission:
+            under_resource_limits = True
+        elif resource_manager.op_resource_allocator_enabled():
             under_resource_limits = (
                 resource_manager.op_resource_allocator.can_submit_new_task(op)
             )

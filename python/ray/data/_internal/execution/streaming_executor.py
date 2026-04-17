@@ -102,6 +102,9 @@ class StreamingExecutor(Executor, threading.Thread):
         self._llf_inter_arrival_time = ctx.llf_inter_arrival_time
         # L: latency target. If None, auto-computed as sum(C_oM) (floored at 1.0).
         self._llf_latency_target = ctx.llf_latency_target
+        # When True, bypass Ray Data's memory-budget admission control for LLF
+        # ops (faithful Cameo baseline).
+        self._llf_disable_admission_control = ctx.llf_disable_admission_control
 
         self._last_debug_log_time = 0
 
@@ -326,6 +329,7 @@ class StreamingExecutor(Executor, threading.Thread):
             scheduling_policy=self._scheduling_policy,
             llf_inter_arrival_time=self._llf_inter_arrival_time,
             llf_latency_target=self._llf_latency_target,
+            llf_disable_admission_control=self._llf_disable_admission_control,
         )
 
         i = 0
@@ -344,6 +348,7 @@ class StreamingExecutor(Executor, threading.Thread):
                 scheduling_policy=self._scheduling_policy,
                 llf_inter_arrival_time=self._llf_inter_arrival_time,
                 llf_latency_target=self._llf_latency_target,
+                llf_disable_admission_control=self._llf_disable_admission_control,
             )
 
         update_operator_states(topology)

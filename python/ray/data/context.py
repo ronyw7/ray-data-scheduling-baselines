@@ -321,6 +321,17 @@ class DataContext:
     # Latency target L for LLF v2/EDF (seconds). If None, auto-computed as
     # sum(avg_task_duration for all ops) (floored at 1.0 during cold start).
     llf_latency_target: Optional[float] = None
+    # When True and scheduling_policy is an LLF variant, bypass Ray Data's
+    # memory-budget admission control (OpResourceAllocator / _execution_allowed)
+    # so scheduling decisions aren't filtered by the Algorithm-2 layer. This is
+    # the faithful Cameo baseline: Cameo only has per-operator flow control
+    # (hasOutputBufferSpace, line 11 of Algorithm 1), not memory-aware
+    # admission. Basic backpressure policies (concurrency caps, output buffer
+    # limits via `should_add_input`) are still applied.
+    # WARNING: disabling admission control can lead to OOM on memory-bound
+    # workloads — that's the limitation of pure scheduling policies the paper
+    # is meant to surface.
+    llf_disable_admission_control: bool = False
     use_ray_tqdm: bool = DEFAULT_USE_RAY_TQDM
     enable_progress_bars: bool = DEFAULT_ENABLE_PROGRESS_BARS
     # By default, enable the progress bar for operator-level progress.
