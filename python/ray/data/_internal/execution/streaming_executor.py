@@ -312,6 +312,8 @@ class StreamingExecutor(Executor, threading.Thread):
             topology,
             self._resource_manager,
             self._max_errored_blocks,
+            scheduling_policy=self._scheduling_policy,
+            llf_disable_admission_control=self._llf_disable_admission_control,
         )
         if self._max_errored_blocks > 0:
             self._max_errored_blocks -= num_errored_blocks

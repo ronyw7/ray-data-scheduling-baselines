@@ -419,6 +419,8 @@ def process_completed_tasks(
     topology: Topology,
     resource_manager: ResourceManager,
     max_errored_blocks: int,
+    scheduling_policy: Optional[str] = None,
+    llf_disable_admission_control: bool = False,
 ) -> int:
     """Process any newly completed tasks. To update operator
     states, call `update_operator_states()` afterwards.
@@ -438,8 +440,17 @@ def process_completed_tasks(
         for task in op.get_active_tasks():
             active_tasks[task.get_waitable()] = (state, task)
 
+    # Faithful Cameo baseline: also skip the output-side half of Algorithm 2
+    # (max_task_output_bytes_to_read), which otherwise caps how much output
+    # completed tasks may release into the object store.
+    bypass_admission = llf_disable_admission_control and scheduling_policy in (
+        "llf_v1",
+        "llf_v2",
+        "edf",
+    )
+
     max_bytes_to_read_per_op: Dict[OpState, int] = {}
-    if resource_manager.op_resource_allocator_enabled():
+    if resource_manager.op_resource_allocator_enabled() and not bypass_admission:
         for op, state in topology.items():
             max_bytes_to_read = (
                 resource_manager.op_resource_allocator.max_task_output_bytes_to_read(op)
@@ -447,6 +458,9 @@ def process_completed_tasks(
             op._in_task_output_backpressure = max_bytes_to_read == 0
             if max_bytes_to_read is not None:
                 max_bytes_to_read_per_op[state] = max_bytes_to_read
+    elif bypass_admission:
+        for op in topology:
+            op._in_task_output_backpressure = False
 
     # Process completed Ray tasks and notify operators.
     num_errored_blocks = 0
