@@ -694,8 +694,11 @@ def select_operator_to_run(
     """
     # Faithful Cameo baseline: skip Ray Data's memory-budget admission control
     # (Algorithm 2) for LLF scheduling. Cameo only has per-op flow control via
-    # hasOutputBufferSpace (preserved below by `should_add_input`) and the
-    # backpressure policies (concurrency caps).
+    # hasOutputBufferSpace, preserved below by `should_add_input`. We also skip
+    # ConcurrencyCapBackpressurePolicy here because the `concurrency=` values on
+    # map/map_batches are boilerplate required for Ray Data to dispatch at all,
+    # not deliberate per-op flow control — applying them would artificially
+    # throttle the producer and hide the OOM failure mode the baseline targets.
     bypass_admission = llf_disable_admission_control and scheduling_policy in (
         "llf_v1",
         "llf_v2",
@@ -713,9 +716,11 @@ def select_operator_to_run(
             )
         else:
             under_resource_limits = _execution_allowed(op, resource_manager)
-        in_backpressure = not under_resource_limits or any(
-            not p.can_add_input(op) for p in backpressure_policies
-        )
+        if bypass_admission:
+            policy_blocks = False
+        else:
+            policy_blocks = any(not p.can_add_input(op) for p in backpressure_policies)
+        in_backpressure = not under_resource_limits or policy_blocks
         op_runnable = False
         if (
             not in_backpressure
