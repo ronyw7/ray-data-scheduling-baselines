@@ -315,12 +315,12 @@ class DataContext:
     #   "llf_v1" = Cameo LLF with t_M=0, L=0 (collapses to stage-by-stage)
     #   "llf_v2" = Cameo LLF with t_M=i*T, L=configurable
     #   "edf"    = Cameo EDF (deadline without self-cost C_oM)
-    scheduling_policy: Optional[str] = None
+    scheduling_policy: Optional[str] = "llf_v2"
     # Inter-arrival time T for LLF v2: t_M = partition_index * T (seconds).
     llf_inter_arrival_time: float = 0.1
     # Latency target L for LLF v2/EDF (seconds). If None, auto-computed as
     # sum(avg_task_duration for all ops) (floored at 1.0 during cold start).
-    llf_latency_target: Optional[float] = None
+    llf_latency_target: Optional[float] = 5
     # When True and scheduling_policy is an LLF variant, bypass Ray Data's
     # memory-budget admission control (OpResourceAllocator / _execution_allowed)
     # so scheduling decisions aren't filtered by the Algorithm-2 layer. This is
@@ -346,9 +346,9 @@ class DataContext:
     )
     write_file_retry_on_errors: List[str] = DEFAULT_WRITE_FILE_RETRY_ON_ERRORS
     warn_on_driver_memory_usage_bytes: int = DEFAULT_WARN_ON_DRIVER_MEMORY_USAGE_BYTES
-    actor_task_retry_on_errors: Union[
-        bool, List[BaseException]
-    ] = DEFAULT_ACTOR_TASK_RETRY_ON_ERRORS
+    actor_task_retry_on_errors: Union[bool, List[BaseException]] = (
+        DEFAULT_ACTOR_TASK_RETRY_ON_ERRORS
+    )
     op_resource_reservation_enabled: bool = DEFAULT_ENABLE_OP_RESOURCE_RESERVATION
     op_resource_reservation_ratio: float = DEFAULT_OP_RESOURCE_RESERVATION_RATIO
     max_errored_blocks: int = DEFAULT_MAX_ERRORED_BLOCKS
