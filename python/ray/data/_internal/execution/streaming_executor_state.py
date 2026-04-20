@@ -289,7 +289,10 @@ class OpState:
             self.op._in_task_submission_backpressure
             or self.op._in_task_output_backpressure
         ):
-            desc += " [backpressured]"
+            desc += (
+                f" [backpressured sub={self.op._in_task_submission_backpressure}"
+                f" out={self.op._in_task_output_backpressure}]"
+            )
 
         # Actors info
         desc += self.op.actor_info_progress_str()
