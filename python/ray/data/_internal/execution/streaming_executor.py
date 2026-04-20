@@ -79,14 +79,14 @@ class StreamingExecutor(Executor, threading.Thread):
         self._has_op_completed: Optional[Dict[PhysicalOperator, bool]] = None
         self._max_errored_blocks = DataContext.get_current().max_errored_blocks
         self._num_errored_blocks = 0
-        
+
         ctx = DataContext.get_current()
         self._scheduling_policy = ctx.scheduling_policy
 
         # Least-Laxity-First (LLF) scheduling policy parameters.
         # Implements Cameo (NSDI'21) Equation 2 for operator selection:
         #
-        #   ddl_M = ddl_M = t_M + L - C_oM - C_path 
+        #   ddl_M = ddl_M = t_M + L - C_oM - C_path
         #   selected_op = argmin(ddl_M)
         #
         # where:
@@ -102,8 +102,7 @@ class StreamingExecutor(Executor, threading.Thread):
         self._llf_inter_arrival_time = ctx.llf_inter_arrival_time
         # L: latency target. If None, auto-computed as sum(C_oM) (floored at 1.0).
         self._llf_latency_target = ctx.llf_latency_target
-        # When True, bypass Ray Data's memory-budget admission control for LLF
-        # ops (faithful Cameo baseline).
+        # When True, disable Ray Data's default admission control policies.
         self._llf_disable_admission_control = ctx.llf_disable_admission_control
 
         self._last_debug_log_time = 0
