@@ -317,21 +317,17 @@ class DataContext:
     #   "edf"    = Cameo EDF (deadline without self-cost C_oM)
     scheduling_policy: Optional[str] = "llf_v2"
     # Inter-arrival time T for LLF v2: t_M = partition_index * T (seconds).
-    llf_inter_arrival_time: float = 0.1
+    llf_inter_arrival_time: float = 1
     # Latency target L for LLF v2/EDF (seconds). If None, auto-computed as
     # sum(avg_task_duration for all ops) (floored at 1.0 during cold start).
     llf_latency_target: Optional[float] = 5
-    # When True and scheduling_policy is an LLF variant, bypass Ray Data's
-    # memory-budget admission control (OpResourceAllocator / _execution_allowed)
-    # so scheduling decisions aren't filtered by the Algorithm-2 layer. This is
-    # the faithful Cameo baseline: Cameo only has per-operator flow control
-    # (hasOutputBufferSpace, line 11 of Algorithm 1), not memory-aware
-    # admission. Basic backpressure policies (concurrency caps, output buffer
-    # limits via `should_add_input`) are still applied.
-    # WARNING: disabling admission control can lead to OOM on memory-bound
-    # workloads — that's the limitation of pure scheduling policies the paper
-    # is meant to surface.
-    llf_disable_admission_control: bool = False
+    # Disable Ray Data's default admission control for the Cameo baseline.
+    # two call sites in streaming_executor_state.py:
+    #   - process_completed_tasks (line ~446): skips the output-side throttle
+    #     (OpResourceAllocator.max_task_output_bytes_to_read).
+    #   - select_operator_to_run (line ~702): skips the submission-side throttle
+    #     (OpResourceAllocator.can_submit_new_task) and ConcurrencyCapBackpressurePolicy.
+    llf_disable_admission_control: bool = True
     use_ray_tqdm: bool = DEFAULT_USE_RAY_TQDM
     enable_progress_bars: bool = DEFAULT_ENABLE_PROGRESS_BARS
     # By default, enable the progress bar for operator-level progress.

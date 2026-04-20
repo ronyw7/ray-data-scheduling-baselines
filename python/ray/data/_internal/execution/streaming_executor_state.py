@@ -440,9 +440,8 @@ def process_completed_tasks(
         for task in op.get_active_tasks():
             active_tasks[task.get_waitable()] = (state, task)
 
-    # Faithful Cameo baseline: also skip the output-side half of Algorithm 2
-    # (max_task_output_bytes_to_read), which otherwise caps how much output
-    # completed tasks may release into the object store.
+    # Ray data caps how much output completed tasks may release into the object store.
+    # We skip this for the cameo baseline
     bypass_admission = llf_disable_admission_control and scheduling_policy in (
         "llf_v1",
         "llf_v2",
@@ -692,13 +691,8 @@ def select_operator_to_run(
     provides backpressure if the consumer is slow. However, once a bundle is returned
     to the user, it is no longer tracked.
     """
-    # Faithful Cameo baseline: skip Ray Data's memory-budget admission control
-    # (Algorithm 2) for LLF scheduling. Cameo only has per-op flow control via
-    # hasOutputBufferSpace, preserved below by `should_add_input`. We also skip
-    # ConcurrencyCapBackpressurePolicy here because the `concurrency=` values on
-    # map/map_batches are boilerplate required for Ray Data to dispatch at all,
-    # not deliberate per-op flow control — applying them would artificially
-    # throttle the producer and hide the OOM failure mode the baseline targets.
+
+    # Skip admission control for the Cameo baseline
     bypass_admission = llf_disable_admission_control and scheduling_policy in (
         "llf_v1",
         "llf_v2",
@@ -757,9 +751,9 @@ def select_operator_to_run(
     selected_op = None
     if ops:
         if scheduling_policy in ("llf_v1", "llf_v2", "edf"):
-            # Cameo-style scheduling (Equation 2):
-            #   ddl_M = t_M + L - C_oM - C_path    (priority; lower = higher pri.)
-            # Pick operator with minimum start-deadline (most urgent).
+            # Use Cameo-style scheduling:
+            #   ddl_M = t_M + L - C_oM - C_path
+            # Here we pick the perator with the minimum start-deadline (ddl_M).
             c_path = _compute_c_path(topology)
             latency_target = _get_latency_target(
                 scheduling_policy,
@@ -768,7 +762,7 @@ def select_operator_to_run(
             )
 
             def _llf_key(op):
-                # EDF omits C_oM from the deadline (per Cameo paper).
+                # EDF omits C_oM from the deadline.
                 c_om = _avg_task_duration(op) if scheduling_policy != "edf" else 0.0
                 deadline = _compute_min_deadline(
                     op,
