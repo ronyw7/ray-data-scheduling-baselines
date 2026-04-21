@@ -321,12 +321,15 @@ class DataContext:
     # Latency target L for LLF v2/EDF (seconds). If None, auto-computed as
     # sum(avg_task_duration for all ops) (floored at 1.0 during cold start).
     llf_latency_target: Optional[float] = 5
-    # Disable Ray Data's default admission control for the Cameo baseline.
-    # two call sites in streaming_executor_state.py:
-    #   - process_completed_tasks (line ~446): skips the output-side throttle
+    # Disable Ray Data's Algorithm-2 memory admission for the Cameo baseline.
+    # Bypasses the two OpResourceAllocator hooks that Cameo lacks:
+    #   - process_completed_tasks: skips the output-side throttle
     #     (OpResourceAllocator.max_task_output_bytes_to_read).
-    #   - select_operator_to_run (line ~702): skips the submission-side throttle
-    #     (OpResourceAllocator.can_submit_new_task) and ConcurrencyCapBackpressurePolicy.
+    #   - select_operator_to_run: skips the submission-side throttle
+    #     (OpResourceAllocator.can_submit_new_task).
+    # ConcurrencyCapBackpressurePolicy stays on — it models Cameo's fixed
+    # worker pool (N workers pulling from channels), which is architectural,
+    # not part of Ray Data's dynamic memory machinery.
     llf_disable_admission_control: bool = True
     # Path to a JSONL file where per-tick LLF scheduling decisions are logged.
     llf_trace_path: Optional[str] = None

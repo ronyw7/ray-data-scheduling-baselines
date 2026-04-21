@@ -715,10 +715,7 @@ def select_operator_to_run(
             )
         else:
             under_resource_limits = _execution_allowed(op, resource_manager)
-        if bypass_admission:
-            policy_blocks = False
-        else:
-            policy_blocks = any(not p.can_add_input(op) for p in backpressure_policies)
+        policy_blocks = any(not p.can_add_input(op) for p in backpressure_policies)
         in_backpressure = not under_resource_limits or policy_blocks
         op_runnable = False
         if (
@@ -817,11 +814,7 @@ def select_operator_to_run(
                     "out_bp": op._in_task_output_backpressure,
                 }
                 if is_llf:
-                    c_om = (
-                        _avg_task_duration(op)
-                        if scheduling_policy != "edf"
-                        else 0.0
-                    )
+                    c_om = _avg_task_duration(op) if scheduling_policy != "edf" else 0.0
                     cp = c_path.get(op, 0.0)
                     entry["C_oM"] = c_om
                     entry["C_path"] = cp
