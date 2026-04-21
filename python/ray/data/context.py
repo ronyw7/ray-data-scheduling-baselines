@@ -328,6 +328,10 @@ class DataContext:
     #   - select_operator_to_run (line ~702): skips the submission-side throttle
     #     (OpResourceAllocator.can_submit_new_task) and ConcurrencyCapBackpressurePolicy.
     llf_disable_admission_control: bool = True
+    # Path to a JSONL file where per-tick LLF scheduling decisions are logged.
+    llf_trace_path: Optional[str] = None
+    # Minimum wall-clock interval between consecutive trace records (seconds).
+    llf_trace_min_interval: float = 0.05
     use_ray_tqdm: bool = DEFAULT_USE_RAY_TQDM
     enable_progress_bars: bool = DEFAULT_ENABLE_PROGRESS_BARS
     # By default, enable the progress bar for operator-level progress.

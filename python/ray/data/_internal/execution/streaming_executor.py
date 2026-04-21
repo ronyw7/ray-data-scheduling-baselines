@@ -104,6 +104,9 @@ class StreamingExecutor(Executor, threading.Thread):
         self._llf_latency_target = ctx.llf_latency_target
         # When True, disable Ray Data's default admission control policies.
         self._llf_disable_admission_control = ctx.llf_disable_admission_control
+        # Optional JSONL trace of scheduling decisions (None = disabled).
+        self._llf_trace_path = ctx.llf_trace_path
+        self._llf_trace_min_interval = ctx.llf_trace_min_interval
 
         self._last_debug_log_time = 0
 
@@ -331,6 +334,8 @@ class StreamingExecutor(Executor, threading.Thread):
             llf_inter_arrival_time=self._llf_inter_arrival_time,
             llf_latency_target=self._llf_latency_target,
             llf_disable_admission_control=self._llf_disable_admission_control,
+            llf_trace_path=self._llf_trace_path,
+            llf_trace_min_interval=self._llf_trace_min_interval,
         )
 
         i = 0

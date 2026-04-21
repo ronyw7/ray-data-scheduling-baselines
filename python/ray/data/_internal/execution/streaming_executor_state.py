@@ -680,6 +680,8 @@ def select_operator_to_run(
     llf_inter_arrival_time: float = 0.1,
     llf_latency_target: Optional[float] = None,
     llf_disable_admission_control: bool = False,
+    llf_trace_path: Optional[str] = None,
+    llf_trace_min_interval: float = 0.05,
 ) -> Optional[PhysicalOperator]:
     """Select an operator to run, if possible.
 
@@ -752,18 +754,20 @@ def select_operator_to_run(
         ]
 
     selected_op = None
+    # Pre-compute LLF-only values so we can both pick and trace with them.
+    is_llf = scheduling_policy in ("llf_v1", "llf_v2", "edf")
+    c_path: Dict[PhysicalOperator, float] = {}
+    latency_target = 0.0
+    if is_llf:
+        c_path = _compute_c_path(topology)
+        latency_target = _get_latency_target(
+            scheduling_policy,
+            topology,
+            llf_latency_target,
+        )
     if ops:
-        if scheduling_policy in ("llf_v1", "llf_v2", "edf"):
-            # Use Cameo-style scheduling:
-            #   ddl_M = t_M + L - C_oM - C_path
-            # Here we pick the perator with the minimum start-deadline (ddl_M).
-            c_path = _compute_c_path(topology)
-            latency_target = _get_latency_target(
-                scheduling_policy,
-                topology,
-                llf_latency_target,
-            )
-
+        if is_llf:
+            # Cameo-style scheduling: argmin(ddl_M = t_M + L - C_oM - C_path).
             def _llf_key(op):
                 # EDF omits C_oM from the deadline.
                 c_om = _avg_task_duration(op) if scheduling_policy != "edf" else 0.0
@@ -779,43 +783,7 @@ def select_operator_to_run(
                 # Metadata-only operators still get priority.
                 return (not op.throttling_disabled(), deadline)
 
-            # Log detailed breakdown for each eligible operator.
-            # Uses print() because the executor runs on a background thread
-            # where the logging configuration may not propagate.
-            import os
-
-            if os.environ.get("RAY_DATA_LLF_DEBUG"):
-                details = []
-                for op in ops:
-                    c_om = _avg_task_duration(op) if scheduling_policy != "edf" else 0.0
-                    cp = c_path.get(op, 0.0)
-                    # Peek at the head bundle's t_M.
-                    t_m_str = "n/a"
-                    for inq in topology[op].inqueues:
-                        b = inq.peek()
-                        if b is not None:
-                            t_m = _get_t_m(b, scheduling_policy, llf_inter_arrival_time)
-                            idx = b.partition_index
-                            ddl = t_m + latency_target - c_om - cp
-                            t_m_str = f"t_M={t_m:.3f} idx={idx} ddl={ddl:.3f}"
-                            break
-                    details.append(
-                        f"    {op.name}: C_oM={c_om:.3f} C_path={cp:.3f} {t_m_str}"
-                    )
-                print(
-                    f"LLF [{scheduling_policy}] L={latency_target:.3f} | "
-                    f"{len(ops)} eligible ops:"
-                )
-                for d in details:
-                    print(d)
-
             selected_op = min(ops, key=_llf_key)
-
-            if os.environ.get("RAY_DATA_LLF_DEBUG"):
-                print(
-                    f"  -> selected: {selected_op.name} "
-                    f"(ddl={_llf_key(selected_op)[1]:.3f})"
-                )
         else:
             # Default Ray Data policy: least memory usage.
             selected_op = min(
@@ -826,6 +794,64 @@ def select_operator_to_run(
                 ),
             )
         topology[selected_op]._scheduling_status.selected = True
+
+    # Optional JSONL trace for visualization / debugging.
+    if llf_trace_path:
+        from ray.data._internal.execution.llf_tracer import get_tracer
+
+        tracer = get_tracer(llf_trace_path, llf_trace_min_interval)
+        if tracer is not None:
+            ops_info = []
+            for op, state in topology.items():
+                entry: Dict[str, object] = {
+                    "name": op.name,
+                    "runnable": state._scheduling_status.runnable,
+                    "under_limits": state._scheduling_status.under_resource_limits,
+                    "completed": op.completed(),
+                    "num_queued": state.num_queued(),
+                    "num_active_tasks": op.num_active_tasks(),
+                    "inqueue_mem": state.inqueue_memory_usage(),
+                    "outqueue_blocks": state.outqueue_num_blocks(),
+                    "outqueue_mem": state.outqueue_memory_usage(),
+                    "sub_bp": op._in_task_submission_backpressure,
+                    "out_bp": op._in_task_output_backpressure,
+                }
+                if is_llf:
+                    c_om = (
+                        _avg_task_duration(op)
+                        if scheduling_policy != "edf"
+                        else 0.0
+                    )
+                    cp = c_path.get(op, 0.0)
+                    entry["C_oM"] = c_om
+                    entry["C_path"] = cp
+                    # Peek at head bundle's t_M / partition_index if present.
+                    head_t_m: Optional[float] = None
+                    head_idx: Optional[int] = None
+                    for inq in state.inqueues:
+                        b = inq.peek()
+                        if b is not None:
+                            head_t_m = _get_t_m(
+                                b, scheduling_policy, llf_inter_arrival_time
+                            )
+                            head_idx = b.partition_index
+                            break
+                    entry["head_t_M"] = head_t_m
+                    entry["head_idx"] = head_idx
+                    entry["deadline"] = (
+                        head_t_m + latency_target - c_om - cp
+                        if head_t_m is not None
+                        else None
+                    )
+                ops_info.append(entry)
+            tracer.log_decision(
+                policy=scheduling_policy or "default",
+                latency_target=latency_target,
+                inter_arrival_time=llf_inter_arrival_time,
+                ops_info=ops_info,
+                selected=selected_op.name if selected_op is not None else None,
+            )
+
     autoscaler.try_trigger_scaling()
     return selected_op
 
