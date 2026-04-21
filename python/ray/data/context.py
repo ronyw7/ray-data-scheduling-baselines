@@ -310,6 +310,31 @@ class DataContext:
     execution_options: "ExecutionOptions" = field(
         default_factory=_execution_options_factory
     )
+    # Operator scheduling policy for baseline experiments:
+    #   None    = default Ray Data (least memory usage)
+    #   "llf_v1" = Cameo LLF with t_M=0, L=0 (collapses to stage-by-stage)
+    #   "llf_v2" = Cameo LLF with t_M=i*T, L=configurable
+    #   "edf"    = Cameo EDF (deadline without self-cost C_oM)
+    scheduling_policy: Optional[str] = "llf_v2"
+    # Inter-arrival time T for LLF v2: t_M = partition_index * T (seconds).
+    llf_inter_arrival_time: float = 1
+    # Latency target L for LLF v2/EDF (seconds). If None, auto-computed as
+    # sum(avg_task_duration for all ops) (floored at 1.0 during cold start).
+    llf_latency_target: Optional[float] = 5
+    # Disable Ray Data's Algorithm-2 memory admission for the Cameo baseline.
+    # Bypasses the two OpResourceAllocator hooks that Cameo lacks:
+    #   - process_completed_tasks: skips the output-side throttle
+    #     (OpResourceAllocator.max_task_output_bytes_to_read).
+    #   - select_operator_to_run: skips the submission-side throttle
+    #     (OpResourceAllocator.can_submit_new_task).
+    # ConcurrencyCapBackpressurePolicy stays on — it models Cameo's fixed
+    # worker pool (N workers pulling from channels), which is architectural,
+    # not part of Ray Data's dynamic memory machinery.
+    llf_disable_admission_control: bool = True
+    # Path to a JSONL file where per-tick LLF scheduling decisions are logged.
+    llf_trace_path: Optional[str] = None
+    # Minimum wall-clock interval between consecutive trace records (seconds).
+    llf_trace_min_interval: float = 0.05
     use_ray_tqdm: bool = DEFAULT_USE_RAY_TQDM
     enable_progress_bars: bool = DEFAULT_ENABLE_PROGRESS_BARS
     # By default, enable the progress bar for operator-level progress.
@@ -324,9 +349,9 @@ class DataContext:
     )
     write_file_retry_on_errors: List[str] = DEFAULT_WRITE_FILE_RETRY_ON_ERRORS
     warn_on_driver_memory_usage_bytes: int = DEFAULT_WARN_ON_DRIVER_MEMORY_USAGE_BYTES
-    actor_task_retry_on_errors: Union[
-        bool, List[BaseException]
-    ] = DEFAULT_ACTOR_TASK_RETRY_ON_ERRORS
+    actor_task_retry_on_errors: Union[bool, List[BaseException]] = (
+        DEFAULT_ACTOR_TASK_RETRY_ON_ERRORS
+    )
     op_resource_reservation_enabled: bool = DEFAULT_ENABLE_OP_RESOURCE_RESERVATION
     op_resource_reservation_ratio: float = DEFAULT_OP_RESOURCE_RESERVATION_RATIO
     max_errored_blocks: int = DEFAULT_MAX_ERRORED_BLOCKS

@@ -80,6 +80,34 @@ class StreamingExecutor(Executor, threading.Thread):
         self._max_errored_blocks = DataContext.get_current().max_errored_blocks
         self._num_errored_blocks = 0
 
+        ctx = DataContext.get_current()
+        self._scheduling_policy = ctx.scheduling_policy
+
+        # Least-Laxity-First (LLF) scheduling policy parameters.
+        # Implements Cameo (NSDI'21) Equation 2 for operator selection:
+        #
+        #   ddl_M = ddl_M = t_M + L - C_oM - C_path
+        #   selected_op = argmin(ddl_M)
+        #
+        # where:
+        #   t_M    = message creation time. In v1: t_M=0. In v2: t_M = i * T
+        #            where i is the partition index.
+        #   L      = latency constraint (user-specified SLA). In v1: L=0.
+        #   C_oM   = estimated execution cost at operator o (profiled avg task
+        #            duration). Omitted in EDF variant.
+        #   C_path = max critical path cost from o to any sink operator,
+        #            computed as sum of C_oM along the longest downstream path.
+        #
+        # T: inter-arrival time for simulated streaming arrivals (v2 only).
+        self._llf_inter_arrival_time = ctx.llf_inter_arrival_time
+        # L: latency target. If None, auto-computed as sum(C_oM) (floored at 1.0).
+        self._llf_latency_target = ctx.llf_latency_target
+        # When True, disable Ray Data's default admission control policies.
+        self._llf_disable_admission_control = ctx.llf_disable_admission_control
+        # Optional JSONL trace of scheduling decisions (None = disabled).
+        self._llf_trace_path = ctx.llf_trace_path
+        self._llf_trace_min_interval = ctx.llf_trace_min_interval
+
         self._last_debug_log_time = 0
 
         Executor.__init__(self, options)
@@ -286,6 +314,8 @@ class StreamingExecutor(Executor, threading.Thread):
             topology,
             self._resource_manager,
             self._max_errored_blocks,
+            scheduling_policy=self._scheduling_policy,
+            llf_disable_admission_control=self._llf_disable_admission_control,
         )
         if self._max_errored_blocks > 0:
             self._max_errored_blocks -= num_errored_blocks
@@ -300,6 +330,12 @@ class StreamingExecutor(Executor, threading.Thread):
             self._backpressure_policies,
             self._autoscaler,
             ensure_at_least_one_running=self._consumer_idling(),
+            scheduling_policy=self._scheduling_policy,
+            llf_inter_arrival_time=self._llf_inter_arrival_time,
+            llf_latency_target=self._llf_latency_target,
+            llf_disable_admission_control=self._llf_disable_admission_control,
+            llf_trace_path=self._llf_trace_path,
+            llf_trace_min_interval=self._llf_trace_min_interval,
         )
 
         i = 0
@@ -315,6 +351,10 @@ class StreamingExecutor(Executor, threading.Thread):
                 self._backpressure_policies,
                 self._autoscaler,
                 ensure_at_least_one_running=self._consumer_idling(),
+                scheduling_policy=self._scheduling_policy,
+                llf_inter_arrival_time=self._llf_inter_arrival_time,
+                llf_latency_target=self._llf_latency_target,
+                llf_disable_admission_control=self._llf_disable_admission_control,
             )
 
         update_operator_states(topology)
