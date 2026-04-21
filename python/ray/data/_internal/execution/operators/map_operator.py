@@ -325,9 +325,16 @@ class MapOperator(OneToOneOperator, ABC):
         self._next_data_task_idx += 1
         self._metrics.on_task_submitted(task_index, inputs)
 
+        # Propagate the input bundle's partition_index onto every output bundle
+        # that this task produces. Captured here (not read at completion) so it
+        # remains correct when multiple tasks finish out of dispatch order.
+        input_partition_index = inputs.partition_index
+
         def _output_ready_callback(task_index, output: RefBundle):
             # Since output is streamed, it should only contain one block.
             assert len(output) == 1
+            if input_partition_index is not None and output.partition_index is None:
+                output.partition_index = input_partition_index
             self._metrics.on_task_output_generated(task_index, output)
 
             # Notify output queue that the task has produced an new output.
@@ -368,6 +375,7 @@ class MapOperator(OneToOneOperator, ABC):
             gen,
             lambda output: _output_ready_callback(task_index, output),
             functools.partial(_task_done_callback, task_index),
+            partition_index=input_partition_index,
         )
 
     def _submit_metadata_task(

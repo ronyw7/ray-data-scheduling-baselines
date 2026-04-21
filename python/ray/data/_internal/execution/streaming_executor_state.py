@@ -7,7 +7,7 @@ import logging
 import math
 import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -204,11 +204,6 @@ class OpState:
         self._finished: bool = False
         self._exception: Optional[Exception] = None
         self._scheduling_status = OpSchedulingStatus()
-        # Queue of partition_index values for inputs currently dispatched to
-        # this operator (in-flight tasks). FIFO: each dispatch appends, each
-        # add_output pops and stamps the output bundle. Used by scheduling
-        # policies that need to group bundles into epochs (e.g., microbatch).
-        self._inflight_partition_indices: deque = deque()
 
     def __repr__(self):
         return f"OpState({self.op.name})"
@@ -257,12 +252,13 @@ class OpState:
         return self.op.num_active_tasks() + self.op.internal_queue_size()
 
     def add_output(self, ref: RefBundle) -> None:
-        """Move a bundle produced by the operator to its outqueue."""
-        # Propagate the input partition_index to the output bundle so that
-        # scheduling policies can track a bundle across the DAG. Pops the
-        # earliest in-flight index FIFO-style.
-        if self._inflight_partition_indices and ref.partition_index is None:
-            ref.partition_index = self._inflight_partition_indices.popleft()
+        """Move a bundle produced by the operator to its outqueue.
+
+        Note: output bundles carry `partition_index` stamped at task submission
+        time by MapOperator._submit_data_task (see DataOpTask.partition_index),
+        so no propagation is needed here. This stamping is robust to out-of-
+        order task completion.
+        """
         self.outqueue.append(ref)
         self.num_completed_tasks += 1
         if self.progress_bar:
@@ -307,8 +303,10 @@ class OpState:
         for i, inqueue in enumerate(self.inqueues):
             ref = inqueue.pop()
             if ref is not None:
-                if ref.partition_index is not None:
-                    self._inflight_partition_indices.append(ref.partition_index)
+                # The bundle's partition_index is picked up by the operator
+                # and attached to the resulting DataOpTask (see
+                # MapOperator._submit_data_task), so scheduling policies can
+                # query in-flight epochs from live tasks directly.
                 self.op.add_input(ref, input_index=i)
                 return
         assert False, "Nothing to dispatch"
@@ -616,7 +614,13 @@ def select_operator_to_run(
     if ops:
         ctx = DataContext.get_current()
         if ctx.scheduling_policy == "microbatch":
-            selected_op = _microbatch_select(ops, topology, ctx.microbatch_size)
+            selected_op = _microbatch_select(
+                ops,
+                topology,
+                ctx.microbatch_size,
+                group_size=ctx.microbatch_group_size,
+                stage_barrier=ctx.microbatch_stage_barrier,
+            )
         else:
             # Run metadata-only operators first. After that, choose the operator with
             # the least memory usage.
@@ -646,6 +650,21 @@ def _compute_depth_map(topology: Topology) -> Dict[PhysicalOperator, int]:
     return depth
 
 
+def _inflight_partition_indices(state: "OpState") -> List[int]:
+    """Return the partition_index of each in-flight task on this op.
+
+    Sources from live DataOpTask instances (stamped at task submission by
+    MapOperator._submit_data_task) rather than a driver-side mirror, so it
+    stays correct under out-of-order task completion.
+    """
+    indices: List[int] = []
+    for task in state.op.get_active_tasks():
+        pi = getattr(task, "partition_index", None)
+        if pi is not None:
+            indices.append(pi)
+    return indices
+
+
 def _global_min_epoch(topology: Topology, microbatch_size: int) -> Optional[int]:
     """Minimum epoch across all in-flight work and inqueue heads in the DAG.
 
@@ -653,7 +672,7 @@ def _global_min_epoch(topology: Topology, microbatch_size: int) -> Optional[int]
     """
     min_e: Optional[int] = None
     for state in topology.values():
-        for pi in state._inflight_partition_indices:
+        for pi in _inflight_partition_indices(state):
             e = pi // microbatch_size
             if min_e is None or e < min_e:
                 min_e = e
@@ -666,44 +685,124 @@ def _global_min_epoch(topology: Topology, microbatch_size: int) -> Optional[int]
     return min_e
 
 
+def _op_has_pending_at_epoch(
+    state: "OpState", epoch: int, microbatch_size: int
+) -> bool:
+    """Return True iff the op has any queued or in-flight work at the given
+    epoch (where epoch = partition_index // microbatch_size).
+
+    Assumes queues are FIFO-ordered by partition_index, so a queue head whose
+    epoch exceeds `epoch` implies no queued bundles at `epoch` (downstream
+    work cannot overtake upstream emission order).
+    """
+    for pi in _inflight_partition_indices(state):
+        if pi // microbatch_size == epoch:
+            return True
+    for q in state.inqueues:
+        head = q.peek()
+        if (
+            head is not None
+            and head.partition_index is not None
+            and head.partition_index // microbatch_size == epoch
+        ):
+            return True
+    return False
+
+
+def _transitive_ancestors(
+    op: PhysicalOperator,
+) -> List[PhysicalOperator]:
+    """Return all ops reachable from `op` via input_dependencies (exclusive).
+
+    Visits each ancestor exactly once. Safe on DAGs with shared grandparents.
+    """
+    seen: set = set()
+    stack: List[PhysicalOperator] = list(op.input_dependencies)
+    out: List[PhysicalOperator] = []
+    while stack:
+        u = stack.pop()
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        stack.extend(u.input_dependencies)
+    return out
+
+
 def _microbatch_select(
     ops: List[PhysicalOperator],
     topology: Topology,
     microbatch_size: int,
+    group_size: int = 1,
+    stage_barrier: str = "strict",
 ) -> Optional[PhysicalOperator]:
-    """BSP microbatch policy.
+    """Microbatch scheduling policy, with BSP and Drizzle toggles.
 
-    Enforces two barriers:
-      - Intra-batch stage barrier: within the active epoch, pick the shallowest
-        op (topologically earliest) with pending work.
-      - Inter-batch barrier: no op at epoch E+1 may run while any op in the DAG
-        still has work pending for epoch E (either in-flight or in its inqueue).
+    Two orthogonal barriers parameterize the 2x2 ablation:
 
-    Both barriers collapse to one rule: find the global minimum epoch across all
-    pending work, then select the shallowest runnable op whose inqueue head is
-    at that epoch. If the minimum epoch is only present as in-flight work (no
-    op's inqueue head matches), return None and wait for the in-flight tasks to
-    drain.
+      - Inter-batch barrier (controlled by `group_size` G):
+          An op's inqueue head may dispatch only if its epoch lies within
+          [min_epoch, min_epoch + G). G=1 is strict Spark-Streaming BSP;
+          G>1 is Drizzle group scheduling (up to G epochs concurrent).
+
+      - Intra-batch stage barrier (controlled by `stage_barrier`):
+          "strict"  -- op X may dispatch at epoch E only if every transitive
+                       ancestor has zero pending epoch-E work. Preserves the
+                       invariant "all in-flight tasks at epoch E share one op."
+          "relaxed" -- no stage barrier (Drizzle pre-scheduling): dispatch as
+                       soon as an eligible bundle is at the head of the inqueue.
+
+    Tie-breaker: shallowest-first (topological depth). This matches BSP
+    stage-by-stage dispatch order; under relaxed barriers it biases the
+    pipeline to "fill from the front" but does not change correctness.
+
+    Returns None when no op can dispatch under the active barriers (e.g., the
+    min-epoch work is still in flight upstream under strict BSP). Falls back
+    to `ops[0]` if no stamped bundles exist anywhere (unit-test safety).
     """
     B = max(1, microbatch_size)
+    G = max(1, group_size)
     min_e = _global_min_epoch(topology, B)
     if min_e is None:
-        # No stamped bundles anywhere (e.g., tests with unstamped input). Fall
-        # back to running the first runnable op to avoid deadlock.
         return ops[0]
+    # Inter-batch barrier: head epoch must lie in [min_e, min_e + G).
+    upper = min_e + G
     eligible: List[PhysicalOperator] = []
     for op in ops:
         state = topology[op]
         for q in state.inqueues:
             head = q.peek()
             if head is not None and head.partition_index is not None:
-                if head.partition_index // B == min_e:
+                head_e = head.partition_index // B
+                if min_e <= head_e < upper:
                     eligible.append(op)
                     break
     if not eligible:
-        # The min-epoch work is in-flight upstream; wait for it to drain before
-        # dispatching anything further.
         return None
+    # Intra-batch stage barrier (only applied when strict). An op is blocked if
+    # any ancestor still has work at the op's head epoch. We check per-op
+    # (not globally at min_e) so group scheduling with strict stage barriers
+    # correctly allows different ops to be at different epochs.
+    if stage_barrier == "strict":
+        def passes_stage_barrier(op: PhysicalOperator) -> bool:
+            state = topology[op]
+            head_e: Optional[int] = None
+            for q in state.inqueues:
+                head = q.peek()
+                if head is not None and head.partition_index is not None:
+                    head_e = head.partition_index // B
+                    break
+            assert head_e is not None  # op was admitted to `eligible`
+            for anc in _transitive_ancestors(op):
+                if anc in topology and _op_has_pending_at_epoch(
+                    topology[anc], head_e, B
+                ):
+                    return False
+            return True
+
+        eligible = [op for op in eligible if passes_stage_barrier(op)]
+        if not eligible:
+            return None
     depth_map = _compute_depth_map(topology)
     return min(eligible, key=lambda op: depth_map[op])
 

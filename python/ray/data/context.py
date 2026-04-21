@@ -342,16 +342,33 @@ class DataContext:
     )
 
     # Scheduling policy selector. None means the default (resource-aware) policy.
-    # Set to "microbatch" to emulate Spark-Streaming / Drizzle-style BSP execution:
-    # bundles are grouped into epochs of `microbatch_size` consecutive input
-    # partitions, with an intra-batch stage barrier (topological, shallowest first)
-    # and an inter-batch barrier (epoch E+1 cannot begin until epoch E fully drains).
+    # Set to "microbatch" to emulate Spark-Streaming / Drizzle-style BSP execution.
+    # The microbatch policy is parameterized by three knobs:
+    #   - microbatch_size (B): bundles per epoch. Epoch = partition_index // B.
+    #   - microbatch_group_size (G): max concurrent epochs. G=1 is strict BSP;
+    #     G>1 relaxes the inter-batch barrier (Drizzle "group scheduling").
+    #   - microbatch_stage_barrier: "strict" enforces the per-epoch intra-batch
+    #     stage barrier; "relaxed" drops it (Drizzle "pre-scheduling").
+    # The four corners of (group_size, stage_barrier) give the standard ablation:
+    #   (1, strict)   = Spark Streaming BSP
+    #   (G, strict)   = group scheduling only
+    #   (1, relaxed)  = pre-scheduling only
+    #   (G, relaxed)  = full Drizzle
     scheduling_policy: Optional[str] = None
 
-    # Number of input partitions (bundles) per microbatch when
-    # `scheduling_policy == "microbatch"`. Epoch of a bundle =
-    # partition_index // microbatch_size.
+    # Number of input partitions (bundles) per microbatch.
     microbatch_size: int = 1
+
+    # Max concurrent epochs under the microbatch policy (Drizzle group scheduling).
+    # Must be >= 1. G=1 is strict Spark-Streaming BSP.
+    microbatch_group_size: int = 1
+
+    # Intra-batch stage barrier mode under the microbatch policy.
+    #   "strict"  -- an op may dispatch at epoch E only if every ancestor has
+    #                zero pending epoch-E work (queued or in-flight).
+    #   "relaxed" -- no stage barrier (Drizzle pre-scheduling); downstream tasks
+    #                may start as soon as their inputs are ready.
+    microbatch_stage_barrier: str = "strict"
 
     def __post_init__(self):
         # The additonal ray remote args that should be added to
