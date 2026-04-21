@@ -37,6 +37,11 @@ class RefBundle:
     # output splits. It is otherwise None.
     output_split_idx: Optional[int] = None
 
+    # Sequential index of this bundle at the source, used by scheduling policies
+    # that need to group bundles into epochs (e.g., microbatch: epoch = idx // B).
+    # Stamped by InputDataBuffer and propagated through the DAG via OpState.
+    partition_index: Optional[int] = None
+
     # Cached location, used for get_cached_location().
     _cached_location: Optional[NodeIdStr] = None
 

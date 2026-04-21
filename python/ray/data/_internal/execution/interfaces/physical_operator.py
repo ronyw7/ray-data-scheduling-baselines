@@ -48,6 +48,7 @@ class DataOpTask(OpTask):
         streaming_gen: ObjectRefGenerator,
         output_ready_callback: Callable[[RefBundle], None],
         task_done_callback: Callable[[Optional[Exception]], None],
+        partition_index: Optional[int] = None,
     ):
         """
         Args:
@@ -55,6 +56,9 @@ class DataOpTask(OpTask):
             output_ready_callback: The callback to call when a new RefBundle is output
                 from the generator.
             task_done_callback: The callback to call when the task is done.
+            partition_index: The partition_index of the input bundle for this task.
+                Read by BSP-style scheduling policies to determine which epoch an
+                in-flight task belongs to. Set at task creation; does not change.
         """
         super().__init__(task_index)
         # TODO(hchen): Right now, the streaming generator is required to yield a Block
@@ -64,6 +68,7 @@ class DataOpTask(OpTask):
         self._streaming_gen = streaming_gen
         self._output_ready_callback = output_ready_callback
         self._task_done_callback = task_done_callback
+        self.partition_index = partition_index
 
     def get_waitable(self) -> ObjectRefGenerator:
         return self._streaming_gen
